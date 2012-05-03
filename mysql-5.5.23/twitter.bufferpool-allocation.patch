@@ -1,0 +1,330 @@
+commit 76e70595e32dc30b1e8de7c3bf86e54cc9cea769
+Author: Davi Arnaut <davi@twitter.com>
+Date:   Tue Nov 8 11:37:00 2011 -0200
+
+    MYSQL-12: Improve MySQL memory allocation, especially under NUMA
+    
+    The problem is that InnoDB buffer pool memory allocations do not
+    follow NUMA policies strictly because pages are lazy-allocated by
+    the OS, and the NUMA policy applies at the time of lazy-allocation
+    rather than the time of reservation. This might lead to out of
+    memory conditions at lazy-allocation time whenever there is memory
+    pressure. A more robust and predictable page allocation model is
+    necessary to mitigate this problem.
+    
+    One strategy to mitigate this problem is to force the OS to
+    pre-allocate the page frames in physical memory required for the
+    buffer pool memory region. To this end, this change implements a new
+    --innodb-buffer-pool-populate option that toggles the preallocation
+    of physical memory for the buffer pool. The preallocation strategy
+    is implemented by using mmap's MAP_POPULATE flag when allocating
+    buffer pool memory, or by pre-faulting the pages if the former does
+    not work.
+
+diff --git a/mysql-test/suite/sys_vars/r/innodb_buffer_pool_populate_basic.result b/mysql-test/suite/sys_vars/r/innodb_buffer_pool_populate_basic.result
+new file mode 100644
+index 0000000..5927678
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/r/innodb_buffer_pool_populate_basic.result
+@@ -0,0 +1,12 @@
++CALL mtr.add_suppression(".* Forcing preallocation by faulting in pages.");
++SELECT @@GLOBAL.innodb_buffer_pool_populate;
++@@GLOBAL.innodb_buffer_pool_populate
++1
++1 Expected
++SET @@GLOBAL.innodb_buffer_pool_populate=0;
++ERROR HY000: Variable 'innodb_buffer_pool_populate' is a read only variable
++Expected error 'Read only variable'
++SELECT @@GLOBAL.innodb_buffer_pool_populate;
++@@GLOBAL.innodb_buffer_pool_populate
++1
++1 Expected
+diff --git a/mysql-test/suite/sys_vars/t/innodb_buffer_pool_populate_basic-master.opt b/mysql-test/suite/sys_vars/t/innodb_buffer_pool_populate_basic-master.opt
+new file mode 100644
+index 0000000..2732e42
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/t/innodb_buffer_pool_populate_basic-master.opt
+@@ -0,0 +1 @@
++--innodb-buffer-pool-populate=true
+diff --git a/mysql-test/suite/sys_vars/t/innodb_buffer_pool_populate_basic.test b/mysql-test/suite/sys_vars/t/innodb_buffer_pool_populate_basic.test
+new file mode 100644
+index 0000000..9307cab
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/t/innodb_buffer_pool_populate_basic.test
+@@ -0,0 +1,16 @@
++--source include/have_innodb.inc
++
++CALL mtr.add_suppression(".* Forcing preallocation by faulting in pages.");
++
++# Display current value of innodb_use_sys_malloc
++SELECT @@GLOBAL.innodb_buffer_pool_populate;
++--echo 1 Expected
++
++# Variable should be read-only
++--error ER_INCORRECT_GLOBAL_LOCAL_VAR
++SET @@GLOBAL.innodb_buffer_pool_populate=0;
++--echo Expected error 'Read only variable'
++
++SELECT @@GLOBAL.innodb_buffer_pool_populate;
++--echo 1 Expected
++
+diff --git a/mysql-5.5.23/storage/innobase/buf/buf0buf.c b/storage/innobase/buf/buf0buf.c
+index 30f37a2..63e3344 100644
+--- a/mysql-5.5.23/storage/innobase/buf/buf0buf.c
++++ b/mysql-5.5.23/storage/innobase/buf/buf0buf.c
+@@ -917,7 +917,8 @@ buf_chunk_init(
+ /*===========*/
+ 	buf_pool_t*	buf_pool,	/*!< in: buffer pool instance */
+ 	buf_chunk_t*	chunk,		/*!< out: chunk of buffers */
+-	ulint		mem_size)	/*!< in: requested size in bytes */
++	ulint		mem_size,	/*!< in: requested size in bytes */
++	my_bool		populate)	/*!< in: virtual page preallocation */
+ {
+ 	buf_block_t*	block;
+ 	byte*		frame;
+@@ -931,7 +932,7 @@ buf_chunk_init(
+ 				  + (UNIV_PAGE_SIZE - 1), UNIV_PAGE_SIZE);
+ 
+ 	chunk->mem_size = mem_size;
+-	chunk->mem = os_mem_alloc_large(&chunk->mem_size);
++	chunk->mem = os_mem_alloc_large(&chunk->mem_size, populate);
+ 
+ 	if (UNIV_UNLIKELY(chunk->mem == NULL)) {
+ 
+@@ -1132,6 +1133,7 @@ buf_pool_init_instance(
+ /*===================*/
+ 	buf_pool_t*	buf_pool,	/*!< in: buffer pool instance */
+ 	ulint		buf_pool_size,	/*!< in: size in bytes */
++	my_bool		populate,	/*!< in: virtual page preallocation */
+ 	ulint		instance_no)	/*!< in: id of the instance */
+ {
+ 	ulint		i;
+@@ -1152,7 +1154,7 @@ buf_pool_init_instance(
+ 
+ 		UT_LIST_INIT(buf_pool->free);
+ 
+-		if (!buf_chunk_init(buf_pool, chunk, buf_pool_size)) {
++		if (!buf_chunk_init(buf_pool, chunk, buf_pool_size, populate)) {
+ 			mem_free(chunk);
+ 			mem_free(buf_pool);
+ 
+@@ -1223,6 +1225,7 @@ ulint
+ buf_pool_init(
+ /*==========*/
+ 	ulint	total_size,	/*!< in: size of the total pool in bytes */
++	my_bool	populate,	/*!< in: virtual page preallocation */
+ 	ulint	n_instances)	/*!< in: number of instances */
+ {
+ 	ulint		i;
+@@ -1240,7 +1243,7 @@ buf_pool_init(
+ 	for (i = 0; i < n_instances; i++) {
+ 		buf_pool_t*	ptr	= &buf_pool_ptr[i];
+ 
+-		if (buf_pool_init_instance(ptr, size, i) != DB_SUCCESS) {
++		if (buf_pool_init_instance(ptr, size, populate, i) != DB_SUCCESS) {
+ 
+ 			/* Free all the instances created so far. */
+ 			buf_pool_free(i);
+diff --git a/mysql-5.5.23/storage/innobase/handler/ha_innodb.cc b/storage/innobase/handler/ha_innodb.cc
+index c066cea..fafbc36 100644
+--- a/mysql-5.5.23/storage/innobase/handler/ha_innodb.cc
++++ b/mysql-5.5.23/storage/innobase/handler/ha_innodb.cc
+@@ -11277,6 +11277,12 @@ static MYSQL_SYSVAR_LONGLONG(buffer_pool_size, innobase_buffer_pool_size,
+   "The size of the memory buffer InnoDB uses to cache data and indexes of its tables.",
+   NULL, NULL, 128*1024*1024L, 5*1024*1024L, LONGLONG_MAX, 1024*1024L);
+ 
++static MYSQL_SYSVAR_BOOL(buffer_pool_populate, srv_buf_pool_populate,
++  PLUGIN_VAR_NOCMDARG | PLUGIN_VAR_READONLY,
++  "Preallocate (pre-fault) the page frames required for the mapping "
++  "established by the buffer pool memory region. Disabled by default.",
++  NULL, NULL, FALSE);
++
+ static MYSQL_SYSVAR_LONG(buffer_pool_instances, innobase_buffer_pool_instances,
+   PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+   "Number of buffer pool instances, set to higher value on high-end machines to increase scalability",
+@@ -11436,6 +11442,7 @@ static struct st_mysql_sys_var* innobase_system_variables[]= {
+   MYSQL_SYSVAR(additional_mem_pool_size),
+   MYSQL_SYSVAR(autoextend_increment),
+   MYSQL_SYSVAR(buffer_pool_size),
++  MYSQL_SYSVAR(buffer_pool_populate),
+   MYSQL_SYSVAR(buffer_pool_instances),
+   MYSQL_SYSVAR(checksums),
+   MYSQL_SYSVAR(commit_concurrency),
+diff --git a/mysql-5.5.23/storage/innobase/include/buf0buf.h b/storage/innobase/include/buf0buf.h
+index c0ff7b1..0ab9401 100644
+--- a/mysql-5.5.23/storage/innobase/include/buf0buf.h
++++ b/mysql-5.5.23/storage/innobase/include/buf0buf.h
+@@ -218,6 +218,7 @@ ulint
+ buf_pool_init(
+ /*=========*/
+ 	ulint	size,		/*!< in: Size of the total pool in bytes */
++	my_bool	populate,	/*!< in: Force virtual page preallocation */
+ 	ulint	n_instances);	/*!< in: Number of instances */
+ /********************************************************************//**
+ Frees the buffer pool at shutdown.  This must not be invoked before
+diff --git a/mysql-5.5.23/storage/innobase/include/os0proc.h b/storage/innobase/include/os0proc.h
+index fd46bd7..b22117c 100644
+--- a/mysql-5.5.23/storage/innobase/include/os0proc.h
++++ b/mysql-5.5.23/storage/innobase/include/os0proc.h
+@@ -58,7 +58,8 @@ UNIV_INTERN
+ void*
+ os_mem_alloc_large(
+ /*===============*/
+-	ulint*	n);			/*!< in/out: number of bytes */
++	ulint*	n,			/*!< in/out: number of bytes */
++	my_bool	populate);		/*!< in: virtual page preallocation */
+ /****************************************************************//**
+ Frees large pages memory. */
+ UNIV_INTERN
+diff --git a/mysql-5.5.23/storage/innobase/include/srv0srv.h b/storage/innobase/include/srv0srv.h
+index dfe7397..add6c79 100644
+--- a/mysql-5.5.23/storage/innobase/include/srv0srv.h
++++ b/mysql-5.5.23/storage/innobase/include/srv0srv.h
+@@ -155,6 +155,7 @@ extern my_bool	srv_use_sys_malloc;
+ extern ibool	srv_use_sys_malloc;
+ #endif /* UNIV_HOTBACKUP */
+ extern ulint	srv_buf_pool_size;	/*!< requested size in bytes */
++extern my_bool	srv_buf_pool_populate;	/*!< virtual page preallocation */
+ extern ulint    srv_buf_pool_instances; /*!< requested number of buffer pool instances */
+ extern ulint	srv_buf_pool_old_size;	/*!< previously requested size */
+ extern ulint	srv_buf_pool_curr_size;	/*!< current size in bytes */
+diff --git a/mysql-5.5.23/storage/innobase/os/os0proc.c b/storage/innobase/os/os0proc.c
+index 0f56a60..f4204a9 100644
+--- a/mysql-5.5.23/storage/innobase/os/os0proc.c
++++ b/mysql-5.5.23/storage/innobase/os/os0proc.c
+@@ -32,6 +32,12 @@ Created 9/30/1995 Heikki Tuuri
+ #include "ut0mem.h"
+ #include "ut0byte.h"
+ 
++/* Linux release version */
++#if defined(UNIV_LINUX) && defined(_GNU_SOURCE)
++#include <string.h>		/* strverscmp() */
++#include <sys/utsname.h>	/* uname() */
++#endif
++
+ /* FreeBSD for example has only MAP_ANON, Linux has MAP_ANONYMOUS and
+ MAP_ANON but MAP_ANON is marked as deprecated */
+ #if defined(MAP_ANONYMOUS)
+@@ -40,6 +46,13 @@ MAP_ANON but MAP_ANON is marked as deprecated */
+ #define OS_MAP_ANON	MAP_ANON
+ #endif
+ 
++/* Linux's MAP_POPULATE */
++#if defined(MAP_POPULATE)
++#define OS_MAP_POPULATE	MAP_POPULATE
++#else
++#define OS_MAP_POPULATE	0
++#endif
++
+ UNIV_INTERN ibool os_use_large_pages;
+ /* Large page size. This may be a boot-time option on some platforms */
+ UNIV_INTERN ulint os_large_page_size;
+@@ -63,13 +76,31 @@ os_proc_get_number(void)
+ }
+ 
+ /****************************************************************//**
++Retrieve and compare operating system release.
++@return	TRUE if the OS release is equal to, or later than release. */
++UNIV_INTERN
++ibool
++os_compare_release(
++/*===============*/
++	const char*	release)	/*!< in: OS release */
++{
++#if defined(UNIV_LINUX) && defined(_GNU_SOURCE)
++	struct utsname name;
++	return uname(&name) == 0 && strverscmp(name.release, release) >= 0;
++#else
++	return 0;
++#endif
++}
++
++/****************************************************************//**
+ Allocates large pages memory.
+ @return	allocated memory */
+ UNIV_INTERN
+ void*
+ os_mem_alloc_large(
+ /*===============*/
+-	ulint*	n)			/*!< in/out: number of bytes */
++	ulint*	n,			/*!< in/out: number of bytes */
++	my_bool	populate)		/*!< in: virtual page preallocation */
+ {
+ 	void*	ptr;
+ 	ulint	size;
+@@ -158,7 +189,8 @@ skip:
+ 	ut_ad(ut_is_2pow(size));
+ 	size = *n = ut_2pow_round(*n + (size - 1), size);
+ 	ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+-		   MAP_PRIVATE | OS_MAP_ANON, -1, 0);
++		   MAP_PRIVATE | OS_MAP_ANON |
++		   (populate ? OS_MAP_POPULATE : 0), -1, 0);
+ 	if (UNIV_UNLIKELY(ptr == (void*) -1)) {
+ 		fprintf(stderr, "InnoDB: mmap(%lu bytes) failed;"
+ 			" errno %lu\n",
+@@ -171,6 +203,25 @@ skip:
+ 		UNIV_MEM_ALLOC(ptr, size);
+ 	}
+ #endif
++
++#if OS_MAP_ANON && OS_MAP_POPULATE
++	/* MAP_POPULATE is only supported for private mappings
++	since Linux 2.6.23. */
++	populate = populate && !os_compare_release("2.6.23");
++
++	if (populate) {
++		fprintf(stderr, "InnoDB: Warning: mmap(MAP_POPULATE) "
++			"is not supported for private mappings. "
++			"Forcing preallocation by faulting in pages.\n");
++	}
++#endif
++
++	/* Initialize the entire buffer to force the allocation
++	of physical memory page frames. */
++	if (populate) {
++		memset(ptr, '\0', size);
++	}
++
+ 	return(ptr);
+ }
+ 
+diff --git a/mysql-5.5.23/storage/innobase/row/row0merge.c b/storage/innobase/row/row0merge.c
+index d42f212..b534b8e 100644
+--- a/mysql-5.5.23/storage/innobase/row/row0merge.c
++++ b/mysql-5.5.23/storage/innobase/row/row0merge.c
+@@ -2616,7 +2616,7 @@ row_merge_build_indexes(
+ 
+ 	merge_files = mem_alloc(n_indexes * sizeof *merge_files);
+ 	block_size = 3 * sizeof *block;
+-	block = os_mem_alloc_large(&block_size);
++	block = os_mem_alloc_large(&block_size, FALSE);
+ 
+ 	for (i = 0; i < n_indexes; i++) {
+ 
+diff --git a/mysql-5.5.23/storage/innobase/srv/srv0srv.c b/storage/innobase/srv/srv0srv.c
+index c7427ab..11a27b1 100644
+--- a/mysql-5.5.23/storage/innobase/srv/srv0srv.c
++++ b/mysql-5.5.23/storage/innobase/srv/srv0srv.c
+@@ -206,6 +206,8 @@ UNIV_INTERN const byte*	srv_latin1_ordering;
+ UNIV_INTERN my_bool	srv_use_sys_malloc	= TRUE;
+ /* requested size in kilobytes */
+ UNIV_INTERN ulint	srv_buf_pool_size	= ULINT_MAX;
++/* force virtual page preallocation (prefault) */
++UNIV_INTERN my_bool	srv_buf_pool_populate	= FALSE;
+ /* requested number of buffer pool instances */
+ UNIV_INTERN ulint       srv_buf_pool_instances  = 1;
+ /* previously requested size */
+diff --git a/mysql-5.5.23/storage/innobase/srv/srv0start.c b/storage/innobase/srv/srv0start.c
+index cf11e75..f825369 100644
+--- a/mysql-5.5.23/storage/innobase/srv/srv0start.c
++++ b/mysql-5.5.23/storage/innobase/srv/srv0start.c
+@@ -1366,7 +1366,8 @@ innobase_start_or_create_for_mysql(void)
+ 			((double) srv_buf_pool_size) / (1024 * 1024));
+ 	}
+ 
+-	err = buf_pool_init(srv_buf_pool_size, srv_buf_pool_instances);
++	err = buf_pool_init(srv_buf_pool_size, srv_buf_pool_populate,
++			    srv_buf_pool_instances);
+ 
+ 	ut_print_timestamp(stderr);
+ 	fprintf(stderr,
